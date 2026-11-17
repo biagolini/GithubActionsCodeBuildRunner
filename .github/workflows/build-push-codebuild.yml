@@ -1,0 +1,101 @@
+# Builds a multi-architecture container image on serverless runners hosted by AWS CodeBuild
+# and pushes it to Amazon ECR. Each job runs on its own ephemeral runner, started by a
+# CodeBuild project through a webhook (WORKFLOW_JOB_QUEUED), and discarded at the end.
+#
+# The runner label has the form codebuild-<project-name>-<run_id>-<run_attempt>.
+# The project name must match the CodeBuild project exactly.
+# The image: label overrides the environment of the project for that job only:
+#   linux-5.0 = Amazon Linux 2023, x86_64   (native amd64 build)
+#   arm-3.0   = Amazon Linux 2023, aarch64  (native arm64 build, no emulation)
+#
+# AWS credentials come from the service role of the CodeBuild project, so there is no
+# configure-aws-credentials step and no secret stored in GitHub.
+name: build-push-codebuild
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            image: linux-5.0
+          - arch: arm64
+            image: arm-3.0
+    runs-on:
+      - codebuild-github-runner-builds-${{ github.run_id }}-${{ github.run_attempt }}
+        image:${{ matrix.image }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Log in to Amazon ECR (private and public)
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_ENV"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws
+
+      - name: Build and push
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA-$ARCH"
+          docker build --provenance=false --sbom=false -t "$IMAGE" .
+
+          BUILT=$(docker image inspect --format '{{.Architecture}}' "$IMAGE")
+          if [ "$BUILT" != "$ARCH" ]; then
+            echo "::error::expected $ARCH, built $BUILT"
+            exit 1
+          fi
+
+          docker push "$IMAGE"
+
+  manifest:
+    needs: build
+    runs-on:
+      - codebuild-github-runner-builds-${{ github.run_id }}-${{ github.run_attempt }}
+    permissions:
+      contents: read
+    steps:
+      - name: Log in to Amazon ECR
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "REGISTRY=$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com" >> "$GITHUB_ENV"
+          aws ecr get-login-password --region "$AWS_REGION" \
+            | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com"
+
+      - name: Create and push the manifest list
+        run: |
+          REPO="$REGISTRY/$ECR_REPOSITORY"
+          docker manifest create "$REPO:$GITHUB_SHA" \
+            "$REPO:$GITHUB_SHA-amd64" \
+            "$REPO:$GITHUB_SHA-arm64"
+          docker manifest push --purge "$REPO:$GITHUB_SHA"
+
+      - name: Check that both platforms are present
+        run: |
+          FOUND=$(docker manifest inspect "$REGISTRY/$ECR_REPOSITORY:$GITHUB_SHA" \
+            | jq -r '[.manifests[].platform | "\(.os)/\(.architecture)"] | sort | join(",")')
+          echo "Platforms: $FOUND"
+          if [ "$FOUND" != "linux/amd64,linux/arm64" ]; then
+            echo "::error::manifest list has $FOUND, expected linux/amd64,linux/arm64"
+            exit 1
+          fi
